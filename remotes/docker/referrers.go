@@ -46,29 +46,29 @@ func (r dockerFetcher) FetchReferrers(ctx context.Context, dgst digest.Digest, a
 
 	for _, host := range hosts {
 		var req *request
-		if host.Capabilities.Has(HostCapabilityReferrers) {
-			req = r.request(host, http.MethodGet, "referrers", dgst.String())
-			for _, artifactType := range artifactTypes {
-				if err := req.addQuery("artifactType", artifactType); err != nil {
-					return nil, desc, err
-				}
-			}
-			if err := req.addNamespace(r.refspec.Hostname()); err != nil {
+		// if host.Capabilities.Has(HostCapabilityReferrers) {
+		req = r.request(host, http.MethodGet, "referrers", dgst.String())
+		for _, artifactType := range artifactTypes {
+			if err := req.addQuery("artifactType", artifactType); err != nil {
 				return nil, desc, err
 			}
-
-			rc, cl, err := r.open(ctx, req, desc.MediaType, 0)
-			if err != nil {
-				if !errdefs.IsNotFound(err) {
-					return nil, desc, err
-				}
-			} else {
-				desc.Size = cl
-				// Digest is not known ahead of time and there is nothing in the distribution
-				// specification defining an HTTP header to return the digest on referrers.
-				return rc, desc, nil
-			}
 		}
+		if err := req.addNamespace(r.refspec.Hostname()); err != nil {
+			return nil, desc, err
+		}
+
+		rc, cl, err := r.open(ctx, req, desc.MediaType, 0)
+		if err != nil {
+			if !errdefs.IsNotFound(err) {
+				return nil, desc, err
+			}
+		} else {
+			desc.Size = cl
+			// Digest is not known ahead of time and there is nothing in the distribution
+			// specification defining an HTTP header to return the digest on referrers.
+			return rc, desc, nil
+		}
+		// }
 		if host.Capabilities.Has(HostCapabilityResolve) {
 			req = r.request(host, http.MethodGet, "manifests", strings.Replace(dgst.String(), ":", "-", 1))
 			if err := req.addNamespace(r.refspec.Hostname()); err != nil {
