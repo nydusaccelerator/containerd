@@ -188,9 +188,14 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		return nil, err
 	}
 
+	snapshotter, err := c.snapshotterFromPodSandboxConfig(ctx, image.ID, sandboxConfig)
+	if err != nil {
+		return nil, err
+	}
+
 	// Set snapshotter before any other options.
 	opts := []containerd.NewContainerOpts{
-		containerd.WithSnapshotter(c.runtimeSnapshotter(ctx, ociRuntime)),
+		containerd.WithSnapshotter(snapshotter),
 		// Prepare container rootfs. This is always writeable even if
 		// the container wants a readonly rootfs since we want to give
 		// the runtime (runc) a chance to modify (e.g. to create mount

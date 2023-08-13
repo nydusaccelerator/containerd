@@ -165,8 +165,13 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	}
 	sOpts = append(sOpts, extraSOpts...)
 
+	snapshotter, err := c.snapshotterFromPodSandboxConfig(ctx, image.ID, config)
+	if err != nil {
+		return nil, err
+	}
+
 	opts := []containerd.NewContainerOpts{
-		containerd.WithSnapshotter(c.runtimeSnapshotter(ctx, ociRuntime)),
+		containerd.WithSnapshotter(snapshotter),
 		customopts.WithNewSnapshot(id, containerdImage, sOpts...),
 		containerd.WithSpec(spec, specOpts...),
 		containerd.WithContainerLabels(sandboxLabels),
