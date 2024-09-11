@@ -336,6 +336,8 @@ func WithUnpackDuplicationSuppressor(suppressor kmutex.KeyedLocker) UnpackOpt {
 	}
 }
 
+type DiscardUnpackedLayersKey struct{}
+
 func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...UnpackOpt) error {
 	ctx, done, err := i.client.WithLease(ctx)
 	if err != nil {
@@ -386,7 +388,12 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string, opts ...Unpa
 		if err != nil {
 			// layer not found in content, try to fetch layer and retry unpack
 			if errdefs.IsNotFound(err) {
-				if _, err2 := i.client.Pull(ctx, i.Name()+"@"+layer.Blob.Digest.String()); err2 != nil {
+				pullOpts := []RemoteOpt{}
+				if discardUnpackedLayers, ok := ctx.Value(DiscardUnpackedLayersKey{}).(bool); ok && discardUnpackedLayers {
+					pullOpts = append(pullOpts, WithChildLabelMap(images.ChildGCLabelsFilterLayers))
+				}
+
+				if _, err2 := i.client.Pull(ctx, i.Name(), pullOpts...); err2 != nil {
 					return fmt.Errorf("fetch lost layer failed: %w : %w", err2, err)
 				}
 				// retry
