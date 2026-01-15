@@ -161,7 +161,7 @@ func TestPusherErrReset(t *testing.T) {
 		Size:      int64(len(ct)),
 	}
 
-	w, err := p.push(context.Background(), desc, remotes.MakeRefKey(context.Background(), desc), false)
+	w, err := p.push(context.Background(), desc, nil, remotes.MakeRefKey(context.Background(), desc), false)
 	assert.NoError(t, err)
 
 	// first push should fail with ErrReset
@@ -254,7 +254,7 @@ func TestPusherInvalidAuthorizationOnMount(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			//t.Parallel()
 
-			p, reg, _, done := samplePusher(t)
+			_, p, reg, _, done := samplePusher(t)
 			defer done()
 
 			var triggered atomic.Bool
@@ -275,7 +275,7 @@ func TestPusherInvalidAuthorizationOnMount(t *testing.T) {
 				},
 			}
 
-			w, err := p.push(context.Background(), desc, remotes.MakeRefKey(context.Background(), desc), false)
+			w, err := p.push(context.Background(), desc, nil, remotes.MakeRefKey(context.Background(), desc), false)
 			require.NoError(t, err)
 
 			_, err = w.Write(ct)
@@ -307,7 +307,7 @@ func (a *mockAuthorizer) AddResponses(ctx context.Context, resp []*http.Response
 	return a.addResponses(ctx, resp)
 }
 
-func tryUpload(ctx context.Context, t *testing.T, p dockerPusher, layerContent []byte) error {
+func tryUpload(ctx context.Context, _ *testing.T, p dockerPusher, layerContent []byte) error {
 	desc := ocispec.Descriptor{
 		MediaType: ocispec.MediaTypeImageLayerGzip,
 		Digest:    digest.FromBytes(layerContent),
@@ -417,7 +417,7 @@ var blobUploadRegexp = regexp.MustCompile(`/([a-z0-9]+)/blobs/uploads/(.*)`)
 
 // uploadableMockRegistry provides minimal registry APIs which are enough to serve requests from dockerPusher.
 type uploadableMockRegistry struct {
-	availableContents  []string
+	availableContents  map[string]bool
 	uploadable         bool
 	putHandlerFunc     func(w http.ResponseWriter, r *http.Request) bool
 	defaultHandlerFunc func(w http.ResponseWriter, r *http.Request) bool
@@ -448,6 +448,7 @@ func (u *uploadableMockRegistry) ServeHTTP(w http.ResponseWriter, r *http.Reques
 }
 
 func (u *uploadableMockRegistry) defaultHandler(w http.ResponseWriter, r *http.Request) {
+	tempContents := bytes.Buffer{}
 	if r.Method == http.MethodPost {
 		if matches := blobUploadRegexp.FindStringSubmatch(r.URL.Path); len(matches) != 0 {
 			if u.uploadable {
@@ -492,12 +493,12 @@ func (u *uploadableMockRegistry) defaultHandler(w http.ResponseWriter, r *http.R
 				w.Header().Set("Docker-Content-Digest", dgstr.Digest().String())
 				w.WriteHeader(http.StatusCreated)
 			} else {
-				if _, err := io.Copy(&u.tempContents, r.Body); err != nil {
+				if _, err := io.Copy(&tempContents, r.Body); err != nil {
 					w.WriteHeader(http.StatusInternalServerError)
 					return
 				}
 				dgstr := digest.Canonical.Digester()
-				if _, err := io.Copy(dgstr.Hash(), &u.tempContents); err != nil {
+				if _, err := io.Copy(dgstr.Hash(), &tempContents); err != nil {
 					w.WriteHeader(http.StatusInternalServerError)
 					return
 				}
@@ -510,7 +511,7 @@ func (u *uploadableMockRegistry) defaultHandler(w http.ResponseWriter, r *http.R
 			return
 		}
 	} else if r.Method == http.MethodPatch {
-		if _, err := io.Copy(&u.tempContents, r.Body); err != nil {
+		if _, err := io.Copy(&tempContents, r.Body); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -738,7 +739,7 @@ func Test_dockerPusher_push(t *testing.T) {
 			test.dp.object = test.dockerBaseObject
 			test.dp.dockerBase.hosts[0].ChunkSize = test.args.chunkSize
 
-			got, err := test.dp.push(context.Background(), desc, test.args.ref, test.args.unavailableOnFail)
+			got, err := test.dp.push(context.Background(), desc, nil, test.args.ref, test.args.unavailableOnFail)
 
 			assert.Equal(t, test.wantErr, err)
 
