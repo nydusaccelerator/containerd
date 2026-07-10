@@ -175,7 +175,7 @@ func TestPusherErrReset(t *testing.T) {
 		Size:      int64(len(ct)),
 	}
 
-	w, err := p.push(context.Background(), desc, remotes.MakeRefKey(context.Background(), desc), false)
+	w, err := p.push(context.Background(), desc, nil, remotes.MakeRefKey(context.Background(), desc), false)
 	assert.NoError(t, err)
 
 	// first push should fail with ErrReset
@@ -289,7 +289,7 @@ func TestPusherInvalidAuthorizationOnMount(t *testing.T) {
 				},
 			}
 
-			w, err := p.push(context.Background(), desc, remotes.MakeRefKey(context.Background(), desc), false)
+			w, err := p.push(context.Background(), desc, nil, remotes.MakeRefKey(context.Background(), desc), false)
 			require.NoError(t, err)
 
 			_, err = w.Write(ct)
@@ -697,7 +697,7 @@ func Test_dockerPusher_push(t *testing.T) {
 
 			test.dp.object = test.dockerBaseObject
 
-			got, err := test.dp.push(context.Background(), desc, test.args.ref, test.args.unavailableOnFail)
+			got, err := test.dp.push(context.Background(), desc, nil, test.args.ref, test.args.unavailableOnFail)
 
 			assert.Equal(t, test.wantErr, err)
 
