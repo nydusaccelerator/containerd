@@ -426,7 +426,7 @@ var blobUploadRegexp = regexp.MustCompile(`/([a-z0-9]+)/blobs/uploads/(.*)`)
 type uploadableMockRegistry struct {
 	availableContents  []string
 	uploadable         bool
-	omitDigestHdr     bool
+	omitDigestHdr      bool
 	putHandlerFunc     func(w http.ResponseWriter, r *http.Request) bool
 	defaultHandlerFunc func(w http.ResponseWriter, r *http.Request) bool
 	locationPrefix     string
@@ -723,6 +723,162 @@ func Test_dockerPusher_push(t *testing.T) {
 			// test whether a proper response has been received after the push operation
 			assert.True(t, test.checkerFunc(pw))
 
+		})
+	}
+}
+
+// --- S14 chunked push unit tests (ported coverage for nydus fork additions) ---
+// These cover the deterministic contracts of pushInChunked's building blocks:
+// splitChunks (PATCH Content-Range boundary sequence + remainder tail block)
+// and parseLocation (mock registry Location header resolution + host/scheme
+// change authorizer handling). The full PATCH+PUT HTTP chaining of
+// pushInChunked is validated at runtime against a real registry (assessment
+// §3.3.2 B).
+
+// TestSplitChunks verifies the chunked-upload chunk boundary contract used by
+// pushInChunked: integer-multiple splits, the remainder tail block
+// (totalSize % chunkSize), degenerate inputs (zero/negative chunkSize, zero
+// totalSize), and a chunkSize larger than the total size (single tail block).
+// This directly validates the PATCH Content-Range sequence pushInChunked emits.
+func TestSplitChunks(t *testing.T) {
+	tests := []struct {
+		name      string
+		totalSize int64
+		chunkSize int64
+		want      []chunk
+	}{
+		{name: "zero chunk size returns empty", totalSize: 100, chunkSize: 0, want: []chunk{}},
+		{name: "negative chunk size returns empty", totalSize: 100, chunkSize: -1, want: []chunk{}},
+		{name: "zero total size returns empty", totalSize: 0, chunkSize: 10, want: []chunk{}},
+		{name: "exact multiple", totalSize: 100, chunkSize: 50, want: []chunk{
+			{number: 1, offset: 0, size: 50},
+			{number: 2, offset: 50, size: 50},
+		}},
+		{name: "remainder tail block", totalSize: 120, chunkSize: 50, want: []chunk{
+			{number: 1, offset: 0, size: 50},
+			{number: 2, offset: 50, size: 50},
+			{number: 3, offset: 100, size: 20},
+		}},
+		{name: "chunk larger than total yields single tail block", totalSize: 30, chunkSize: 50, want: []chunk{
+			{number: 1, offset: 0, size: 30},
+		}},
+		{name: "single byte content", totalSize: 1, chunkSize: 50, want: []chunk{
+			{number: 1, offset: 0, size: 1},
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, splitChunks(tc.totalSize, tc.chunkSize))
+		})
+	}
+}
+
+// mustParseURL parses s and panics on error; used only in TestParseLocation.
+func mustParseURL(s string) *url.URL {
+	u, err := url.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+
+// TestParseLocation verifies how pushInChunked resolves the upload Location
+// header returned by a (mock) registry into the next PATCH/PUT URL and host:
+// path-only locations are prefixed with the current host scheme+host, full
+// URLs are parsed directly, and host/scheme changes redirect the host while
+// stripping the authorizer (unless the original request already targeted the
+// new destination, i.e. a transport-level fallback already redirected it).
+func TestParseLocation(t *testing.T) {
+	auth := &mockAuthorizer{}
+	mkHost := func(scheme, host string, a Authorizer) *RegistryHost {
+		return &RegistryHost{Scheme: scheme, Host: host, Authorizer: a}
+	}
+	mkResp := func(location string, reqURL *url.URL) *http.Response {
+		hdr := http.Header{}
+		if location != "" {
+			hdr.Set("Location", location)
+		}
+		resp := &http.Response{Header: hdr}
+		if reqURL != nil {
+			resp.Request = &http.Request{URL: reqURL}
+		}
+		return resp
+	}
+
+	tests := []struct {
+		name       string
+		resp       *http.Response
+		host       *RegistryHost
+		wantURL    string
+		wantHost   string
+		wantScheme string
+		wantAuth   Authorizer
+	}{
+		{
+			name:       "path-only location is prefixed with host scheme and host",
+			resp:       mkResp("/v2/foo/blobs/uploads/uuid", nil),
+			host:       mkHost("https", "registry.example.com", auth),
+			wantURL:    "https://registry.example.com/v2/foo/blobs/uploads/uuid",
+			wantHost:   "registry.example.com",
+			wantScheme: "https",
+			wantAuth:   auth,
+		},
+		{
+			name:       "full url same host and scheme keeps host and authorizer",
+			resp:       mkResp("https://registry.example.com/v2/foo/blobs/uploads/uuid", nil),
+			host:       mkHost("https", "registry.example.com", auth),
+			wantURL:    "https://registry.example.com/v2/foo/blobs/uploads/uuid",
+			wantHost:   "registry.example.com",
+			wantScheme: "https",
+			wantAuth:   auth,
+		},
+		{
+			name:       "full url without scheme is prefixed with host scheme",
+			resp:       mkResp("registry.example.com/v2/foo/blobs/uploads/uuid", nil),
+			host:       mkHost("https", "registry.example.com", auth),
+			wantURL:    "https://registry.example.com/v2/foo/blobs/uploads/uuid",
+			wantHost:   "registry.example.com",
+			wantScheme: "https",
+			wantAuth:   auth,
+		},
+		{
+			name:       "full url with different host than requested strips authorizer",
+			resp:       mkResp("https://upload.example.com/v2/foo/blobs/uploads/uuid", mustParseURL("https://registry.example.com/v2/foo/blobs/uploads/")),
+			host:       mkHost("https", "registry.example.com", auth),
+			wantURL:    "https://upload.example.com/v2/foo/blobs/uploads/uuid",
+			wantHost:   "upload.example.com",
+			wantScheme: "https",
+			wantAuth:   nil,
+		},
+		{
+			name:       "full url with same host but different scheme strips authorizer",
+			resp:       mkResp("http://registry.example.com/v2/foo/blobs/uploads/uuid", mustParseURL("https://registry.example.com/v2/foo/blobs/uploads/")),
+			host:       mkHost("https", "registry.example.com", auth),
+			wantURL:    "http://registry.example.com/v2/foo/blobs/uploads/uuid",
+			wantHost:   "registry.example.com",
+			wantScheme: "http",
+			wantAuth:   nil,
+		},
+		{
+			name:       "full url with different host matching the redirected request keeps authorizer",
+			resp:       mkResp("https://upload.example.com/v2/foo/blobs/uploads/uuid", mustParseURL("https://upload.example.com/v2/foo/blobs/uploads/")),
+			host:       mkHost("https", "registry.example.com", auth),
+			wantURL:    "https://upload.example.com/v2/foo/blobs/uploads/uuid",
+			wantHost:   "upload.example.com",
+			wantScheme: "https",
+			wantAuth:   auth,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := logtest.WithT(context.Background(), t)
+			gotURL, gotHost, err := parseLocation(ctx, tc.resp, tc.host)
+			require.NoError(t, err)
+			require.NotNil(t, gotURL)
+			assert.Equal(t, tc.wantURL, gotURL.String())
+			assert.Equal(t, tc.wantHost, gotHost.Host)
+			assert.Equal(t, tc.wantScheme, gotHost.Scheme)
+			assert.Equal(t, tc.wantAuth, gotHost.Authorizer)
 		})
 	}
 }
