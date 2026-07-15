@@ -69,6 +69,17 @@ func WithVolumes(volumeMounts map[string]string) containerd.NewContainerOpts {
 		if err != nil {
 			return err
 		}
+		// A rootfs mount carrying an `extraoption` is consumed by a VM runtime
+		// shim (e.g. rund with a nydus rootfs): it only materializes inside the
+		// guest and is not host-mountable, so skip the host-side volume
+		// copy-up; the guest handles image volumes itself.
+		for _, m := range mounts {
+			for _, opt := range m.Options {
+				if strings.HasPrefix(opt, "extraoption=") {
+					return nil
+				}
+			}
+		}
 		// Since only read is needed, append ReadOnly mount option to prevent linux kernel
 		// from syncing whole filesystem in umount syscall.
 		if len(mounts) == 1 && mounts[0].Type == "overlay" {

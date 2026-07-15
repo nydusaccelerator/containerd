@@ -682,6 +682,15 @@ func WithUser(userstr string) SpecOpts {
 						return u.Name == username
 					})
 					if err != nil {
+						if os.IsNotExist(err) || err == ErrNoUsersFound {
+							// The rootfs is not available on the host (e.g. a
+							// guest-pulled or VM/pmem rootfs that only exists inside
+							// the guest). Defer name resolution to the runtime by
+							// recording the user string, mirroring the LCOW path,
+							// instead of failing container creation.
+							s.Process.User.Username = userstr
+							return nil
+						}
 						return err
 					}
 					uid = uint32(user.Uid)
@@ -691,6 +700,11 @@ func WithUser(userstr string) SpecOpts {
 						return g.Name == groupname
 					})
 					if err != nil {
+						if os.IsNotExist(err) || err == ErrNoGroupsFound {
+							s.Process.User.UID = uid
+							s.Process.User.Username = userstr
+							return nil
+						}
 						return err
 					}
 				}
@@ -713,6 +727,12 @@ func WithUser(userstr string) SpecOpts {
 			mounts, err := snapshotter.Mounts(ctx, c.SnapshotKey)
 			if err != nil {
 				return err
+			}
+			if guestOnlyRootfs(mounts) {
+				// The rootfs only exists inside the guest; defer user/group
+				// name resolution to the runtime by recording the user string.
+				s.Process.User.Username = userstr
+				return nil
 			}
 
 			// Use a read-only mount when trying to get user/group information
@@ -778,6 +798,12 @@ func WithUserID(uid uint32) SpecOpts {
 		if err != nil {
 			return err
 		}
+		if guestOnlyRootfs(mounts) {
+			// The rootfs only exists inside the guest; keep the requested uid
+			// and let the guest fix up the gid from its own /etc/passwd.
+			s.Process.User.UID, s.Process.User.GID = uid, 0
+			return nil
+		}
 
 		// Use a read-only mount when trying to get user/group information
 		// from the container's rootfs. Since the option does read operation
@@ -793,6 +819,11 @@ func WithUserID(uid uint32) SpecOpts {
 // it returns error. On Windows this sets the username as provided,
 // the operating system will validate the user when going to run
 // the container.
+//
+// If the rootfs is not available on the host (e.g. a guest-pulled or VM/pmem
+// rootfs that only exists inside the guest), the username is recorded in the
+// spec's Process.User.Username and resolution is deferred to the runtime/guest,
+// instead of failing container creation.
 func WithUsername(username string) SpecOpts {
 	return func(ctx context.Context, client Client, c *containers.Container, s *Spec) (err error) {
 		defer ensureAdditionalGids(s)
@@ -804,6 +835,12 @@ func WithUsername(username string) SpecOpts {
 					return u.Name == username
 				})
 				if err != nil {
+					if os.IsNotExist(err) || err == ErrNoUsersFound {
+						// The rootfs is not available on the host; defer username
+						// resolution to the runtime by recording the name.
+						s.Process.User.Username = username
+						return nil
+					}
 					return err
 				}
 				s.Process.User.UID, s.Process.User.GID = uint32(user.Uid), uint32(user.Gid)
@@ -825,6 +862,12 @@ func WithUsername(username string) SpecOpts {
 			mounts, err := snapshotter.Mounts(ctx, c.SnapshotKey)
 			if err != nil {
 				return err
+			}
+			if guestOnlyRootfs(mounts) {
+				// The rootfs only exists inside the guest; defer username
+				// resolution to the runtime by recording the name.
+				s.Process.User.Username = username
+				return nil
 			}
 
 			// Use a read-only mount when trying to get user/group information
@@ -908,6 +951,11 @@ func WithAdditionalGIDs(userstr string) SpecOpts {
 		if err != nil {
 			return err
 		}
+		if guestOnlyRootfs(mounts) {
+			// The rootfs only exists inside the guest; supplemental groups
+			// are resolved there from the image's /etc/group instead.
+			return nil
+		}
 
 		// Use a read-only mount when trying to get user/group information
 		// from the container's rootfs. Since the option does read operation
@@ -980,6 +1028,18 @@ func WithAppendAdditionalGroups(groups ...string) SpecOpts {
 		mounts, err := snapshotter.Mounts(ctx, c.SnapshotKey)
 		if err != nil {
 			return err
+		}
+		if guestOnlyRootfs(mounts) {
+			// The rootfs only exists inside the guest. Numeric gids can be
+			// applied as-is; named groups would need the guest's /etc/group,
+			// so leave them for the runtime to resolve.
+			defer ensureAdditionalGids(s)
+			for _, group := range groups {
+				if gid, err := strconv.ParseUint(group, 10, 32); err == nil {
+					s.Process.User.AdditionalGids = append(s.Process.User.AdditionalGids, uint32(gid))
+				}
+			}
+			return nil
 		}
 
 		// Use a read-only mount when trying to get user/group information
@@ -1510,6 +1570,40 @@ func WithDevShmSize(kb int64) SpecOpts {
 		}
 		return ErrNoShmMount
 	}
+}
+
+// tryReadonlyMounts is used by the options which are trying to get user/group
+// information from container's rootfs. Since the option does read operation
+// only, this helper will append ReadOnly mount option to prevent linux kernel
+// from syncing whole filesystem in umount syscall.
+//
+// TODO(fuweid):
+//
+// Currently, it only works for overlayfs. I think we can apply it to other
+// kinds of filesystem. Maybe we can return `ro` option by `snapshotter.Mount`
+// API, when the caller passes that experimental annotation
+// `containerd.io/snapshot/readonly.mount` something like that.
+func tryReadonlyMounts(mounts []mount.Mount) []mount.Mount {
+	if len(mounts) == 1 && mounts[0].Type == "overlay" {
+		mounts[0].Options = append(mounts[0].Options, "ro")
+	}
+	return mounts
+}
+
+// guestOnlyRootfs reports whether the rootfs mounts carry an `extraoption`
+// mount option. Such mounts are consumed by a VM runtime shim (e.g. rund with
+// a nydus rootfs): the rootfs only materializes inside the guest and the mount
+// is not host-mountable (the kernel rejects the unknown option), so any
+// host-side temp mount of it is bound to fail and must be skipped.
+func guestOnlyRootfs(mounts []mount.Mount) bool {
+	for _, m := range mounts {
+		for _, opt := range m.Options {
+			if strings.HasPrefix(opt, "extraoption=") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // WithWindowsDevice adds a device exposed to a Windows (WCOW or LCOW) Container

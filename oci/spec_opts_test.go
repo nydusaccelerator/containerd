@@ -39,6 +39,7 @@ import (
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/namespaces"
 )
 
@@ -500,6 +501,68 @@ func TestWithUserNamespace(t *testing.T) {
 	}
 
 }
+
+// TestWithUserDefersOnGuestOnlyRootfs verifies that a named user/group is deferred
+// to the runtime (recorded in Process.User.Username) instead of failing when the
+// rootfs has no /etc/passwd (e.g. a guest-pulled or VM/pmem rootfs served only
+// inside the guest), while a real /etc/passwd still resolves to numeric ids.
+func TestWithUserDefersOnGuestOnlyRootfs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// A rootfs without /etc/passwd. WithUser reads Root.Path directly when the
+	// container has no snapshotter/snapshot key.
+	guestOnly := t.TempDir()
+	for _, userstr := range []string{"admin", "admin:admin"} {
+		s := Spec{Version: specs.Version, Root: &specs.Root{Path: guestOnly}, Process: &specs.Process{}, Linux: &specs.Linux{}}
+		if err := WithUser(userstr)(ctx, nil, &containers.Container{}, &s); err != nil {
+			t.Fatalf("WithUser(%q) on guest-only rootfs should defer, got error: %v", userstr, err)
+		}
+		if s.Process.User.Username != userstr {
+			t.Fatalf("WithUser(%q): expected deferred Username %q, got %q", userstr, userstr, s.Process.User.Username)
+		}
+		if s.Process.User.UID != 0 || s.Process.User.GID != 0 {
+			t.Fatalf("WithUser(%q): expected default uid/gid 0, got %d/%d", userstr, s.Process.User.UID, s.Process.User.GID)
+		}
+	}
+
+	// Positive control: with a real /etc/passwd the named user still resolves to
+	// its numeric uid/gid.
+	withPasswd := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(withPasswd, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(withPasswd, "etc", "passwd"), []byte("admin:x:1000:1000::/home/admin:/bin/sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := Spec{Version: specs.Version, Root: &specs.Root{Path: withPasswd}, Process: &specs.Process{}, Linux: &specs.Linux{}}
+	if err := WithUser("admin")(ctx, nil, &containers.Container{}, &s); err != nil {
+		t.Fatalf("WithUser(admin) with /etc/passwd: unexpected error: %v", err)
+	}
+	if s.Process.User.UID != 1000 || s.Process.User.GID != 1000 {
+		t.Fatalf("WithUser(admin): expected uid/gid 1000, got %d/%d", s.Process.User.UID, s.Process.User.GID)
+	}
+}
+
+// TestGuestOnlyRootfs verifies the detection of rootfs mounts that only
+// materialize inside a guest VM (identified by an `extraoption` mount option).
+func TestGuestOnlyRootfs(t *testing.T) {
+	t.Parallel()
+	if guestOnlyRootfs([]mount.Mount{{Type: "overlay", Source: "overlay", Options: []string{"lowerdir=/a:/b"}}}) {
+		t.Fatal("plain overlay mount should not be guest-only")
+	}
+	if !guestOnlyRootfs([]mount.Mount{{
+		Type:    "fuse.nydus-overlayfs",
+		Source:  "overlay",
+		Options: []string{"lowerdir=/a:/b", "extraoption=eyJmb28iOiJiYXIifQ=="},
+	}}) {
+		t.Fatal("mount with extraoption should be guest-only")
+	}
+	if guestOnlyRootfs(nil) {
+		t.Fatal("empty mounts should not be guest-only")
+	}
+}
+
 func TestWithImageConfigArgs(t *testing.T) {
 	t.Parallel()
 
